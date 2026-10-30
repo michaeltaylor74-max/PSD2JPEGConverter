@@ -1,0 +1,3 @@
+target/
+*.jpg.part
+.DS_Store
