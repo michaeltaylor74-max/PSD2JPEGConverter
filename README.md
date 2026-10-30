@@ -14,13 +14,13 @@ D:\Photos\                       E:\Exports\Photos\
 
 ## Download
 
-Go to the **Releases** page (or the **Actions** tab → latest run → *Artifacts*) and download the zip for your computer:
+Go to the **Releases** page and download the file for your computer (ignore the two "Source code" links, which GitHub adds automatically):
 
 | Computer | File | First launch |
 |---|---|---|
-| Windows | `PSD-to-JPEG-Converter-windows.zip` | If SmartScreen appears, click *More info → Run anyway*. |
-| Mac (Apple Silicon or Intel) | `PSD-to-JPEG-Converter-macos.zip` | Right-click the app → *Open* → *Open* (only needed the first time). |
-| Linux | `PSD-to-JPEG-Converter-linux.tar.gz` | Run `./psd-to-jpeg-converter`. |
+| Windows | `PSD-to-JPEG-Converter-Windows.exe` | Just double-click it. If SmartScreen appears, click *More info → Run anyway*. |
+| Mac (Apple Silicon or Intel) | `PSD-to-JPEG-Converter-Mac.dmg` | Open it and drag the app into *Applications*. The first time, right-click the app → *Open* → *Open*. |
+| Linux | `PSD-to-JPEG-Converter-Linux.tar.gz` | Extract it and run `./psd-to-jpeg-converter`. |
 
 ## Using it
 

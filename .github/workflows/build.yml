@@ -7,6 +7,10 @@ on:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the downloads to (e.g. v1.0.0). Leave blank to just build."
+        required: false
 
 permissions:
   contents: write
@@ -49,10 +53,8 @@ jobs:
         if: matrix.name == 'windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/psd-to-jpeg-converter.exe "dist/PSD to JPEG Converter.exe"
-          Copy-Item README.md dist/
-          Compress-Archive -Path dist/* -DestinationPath PSD-to-JPEG-Converter-windows.zip
+          New-Item -ItemType Directory upload | Out-Null
+          Copy-Item target/release/psd-to-jpeg-converter.exe "upload/PSD-to-JPEG-Converter-Windows.exe"
 
       - name: Package macOS app
         if: matrix.name == 'macos'
@@ -79,23 +81,24 @@ jobs:
           </dict></plist>
           EOF
           codesign --force --deep --sign - "$APP"
-          cp README.md dist/
-          cd dist && zip -r -y ../PSD-to-JPEG-Converter-macos.zip .
+          ln -s /Applications dist/Applications
+          mkdir upload
+          hdiutil create -volname "PSD to JPEG Converter" -srcfolder dist -ov -format UDZO upload/PSD-to-JPEG-Converter-Mac.dmg
 
       - name: Package Linux
         if: matrix.name == 'linux'
         run: |
-          mkdir dist
-          cp target/release/psd-to-jpeg-converter README.md dist/
-          tar -czf PSD-to-JPEG-Converter-linux.tar.gz -C dist .
+          mkdir upload
+          tar -czf upload/PSD-to-JPEG-Converter-Linux.tar.gz -C target/release psd-to-jpeg-converter
 
       - uses: actions/upload-artifact@v4
         with:
           name: PSD-to-JPEG-Converter-${{ matrix.name }}
-          path: PSD-to-JPEG-Converter-${{ matrix.name }}.*
+          path: upload/*
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
-          files: PSD-to-JPEG-Converter-${{ matrix.name }}.*
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          files: upload/*
