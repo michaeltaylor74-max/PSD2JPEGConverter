@@ -27,6 +27,9 @@ struct Cli {
     /// Re-convert files even if the JPEG already exists
     #[arg(long)]
     overwrite: bool,
+    /// Put every JPEG into one folder instead of copying the subfolders
+    #[arg(long)]
+    flatten: bool,
     /// Files to convert at once (0 = one per CPU core)
     #[arg(short, long, default_value_t = 0)]
     threads: usize,
@@ -52,14 +55,14 @@ fn run_cli(cli: Cli) -> i32 {
         return 2;
     }
     let out_root = convert::output_root(&cli.source, &cli.dest);
-    let jobs = convert::find_jobs(&cli.source, &out_root);
+    let jobs = convert::find_jobs(&cli.source, &out_root, cli.flatten);
     if jobs.is_empty() {
         println!("No PSD or PSB files found in {}", cli.source.display());
         return 0;
     }
     println!("Found {} files. Saving to {}", jobs.len(), out_root.display());
 
-    let opts = convert::Options { quality: cli.quality, skip_existing: !cli.overwrite, threads: cli.threads };
+    let opts = convert::Options { quality: cli.quality, skip_existing: !cli.overwrite, threads: cli.threads, flatten: cli.flatten };
     let done = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let problems = Mutex::new(Vec::new());

@@ -15,11 +15,13 @@ pub struct Options {
     pub skip_existing: bool,
     /// Number of files converted at once. 0 = one per CPU core.
     pub threads: usize,
+    /// Put every JPEG straight into one folder instead of copying the subfolders.
+    pub flatten: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { quality: 92, skip_existing: true, threads: 0 }
+        Self { quality: 92, skip_existing: true, threads: 0, flatten: false }
     }
 }
 
@@ -43,7 +45,7 @@ pub fn output_root(source: &Path, dest: &Path) -> PathBuf {
     dest.join(name)
 }
 
-fn is_psd(path: &Path) -> bool {
+pub fn is_psd(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     // Skip macOS "._" metadata files that appear on external drives.
     if name.starts_with("._") {
@@ -56,28 +58,62 @@ fn is_psd(path: &Path) -> bool {
 }
 
 /// Walk `source` and every subfolder, returning one job per PSD/PSB file.
-pub fn find_jobs(source: &Path, out_root: &Path) -> Vec<Job> {
-    let mut jobs: Vec<Job> = WalkDir::new(source)
+///
+/// With `flatten` off, the subfolder layout is copied under `out_root`.
+/// With it on, every JPEG goes straight into `out_root`; when two files share a
+/// name, the folders they came from are added to the name, e.g.
+/// `2024 - Holiday - beach.jpg`.
+pub fn find_jobs(source: &Path, out_root: &Path, flatten: bool) -> Vec<Job> {
+    let mut found: Vec<(PathBuf, PathBuf)> = WalkDir::new(source)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         // Don't descend into the output folder if it lives inside the source.
         .filter(|e| e.file_type().is_file() && !e.path().starts_with(out_root) && is_psd(e.path()))
         .map(|e| {
-            let rel = e.path().strip_prefix(source).unwrap_or(e.path());
-            let out = out_root.join(rel).with_extension("jpg");
-            Job { src: e.path().to_path_buf(), out }
+            let rel = e.path().strip_prefix(source).unwrap_or(e.path()).to_path_buf();
+            (e.path().to_path_buf(), rel)
         })
         .collect();
-    jobs.sort_by(|a, b| a.src.cmp(&b.src));
+    found.sort();
 
-    // "photo.psd" and "photo.psb" in the same folder would both become photo.jpg.
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    let mut jobs: Vec<Job> = if flatten {
+        // Count how many files would end up with each name.
+        let mut counts = std::collections::HashMap::new();
+        for (_, rel) in &found {
+            *counts.entry(rel.file_stem().unwrap_or_default().to_string_lossy().to_lowercase()).or_insert(0) += 1;
+        }
+        found
+            .into_iter()
+            .map(|(src, rel)| {
+                let stem = rel.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                let clash = counts[&stem.to_lowercase()] > 1;
+                let folders: Vec<String> = rel
+                    .parent()
+                    .map(|p| p.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect())
+                    .unwrap_or_default();
+                let name = if clash && !folders.is_empty() {
+                    format!("{} - {stem}.jpg", folders.join(" - "))
+                } else {
+                    format!("{stem}.jpg")
+                };
+                Job { src, out: out_root.join(name) }
+            })
+            .collect()
+    } else {
+        found.into_iter().map(|(src, rel)| Job { src, out: out_root.join(rel).with_extension("jpg") }).collect()
+    };
+
+    // Anything still clashing (e.g. "photo.psd" and "photo.psb" side by side,
+    // or names differing only in capitals) gets a number added.
     let mut seen = std::collections::HashSet::new();
     for job in &mut jobs {
-        if !seen.insert(job.out.clone()) {
-            let stem = job.out.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-            let ext = job.src.extension().unwrap_or_default().to_string_lossy().to_lowercase();
-            job.out.set_file_name(format!("{stem} ({ext}).jpg"));
+        let stem = job.out.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let mut n = 1;
+        while !seen.insert(lower(&job.out)) {
+            n += 1;
+            job.out.set_file_name(format!("{stem} ({n}).jpg"));
         }
     }
     jobs

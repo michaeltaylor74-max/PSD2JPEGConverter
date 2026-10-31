@@ -1,6 +1,6 @@
 [package]
 name = "psd-to-jpeg-converter"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Batch convert Photoshop PSD/PSB files (including every subfolder) to JPEG, keeping the folder structure."
 license = "MIT"
@@ -22,3 +22,6 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 opt-level = 3
 lto = "thin"
 strip = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
