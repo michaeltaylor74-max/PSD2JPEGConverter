@@ -1,6 +1,6 @@
 [package]
 name = "psd-to-jpeg-converter"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Batch convert Photoshop PSD/PSB files (including every subfolder) to JPEG, keeping the folder structure."
 license = "MIT"
@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 eframe = "0.37"
 jpeg-encoder = "0.6"
 psd = "0.3"
+rawler = "0.8"
 rayon = "1"
 rfd = "0.17"
 walkdir = "2"

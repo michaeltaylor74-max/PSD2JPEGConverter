@@ -4,13 +4,14 @@
 mod convert;
 mod decode;
 mod gui;
+mod raw;
 
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Batch convert Photoshop PSD/PSB files to JPEG, including every subfolder.
+/// Batch convert Photoshop PSD/PSB files (and optionally camera raw files) to JPEG, including every subfolder.
 ///
 /// Run with no arguments to open the window. With arguments, it runs in the
 /// terminal: the converted copy goes to <DEST>/<name of SOURCE folder>/...
@@ -30,6 +31,15 @@ struct Cli {
     /// Put every JPEG into one folder instead of copying the subfolders
     #[arg(long)]
     flatten: bool,
+    /// Only convert files directly inside SOURCE, not in its subfolders
+    #[arg(long)]
+    no_subfolders: bool,
+    /// Also convert camera raw files (Sony .ARW, and .CR2, .CR3, .NEF, .RAF, .DNG, ...)
+    #[arg(long)]
+    raw: bool,
+    /// Also copy JPEGs that are already in SOURCE
+    #[arg(long)]
+    copy_jpegs: bool,
     /// Files to convert at once (0 = one per CPU core)
     #[arg(short, long, default_value_t = 0)]
     threads: usize,
@@ -55,17 +65,36 @@ fn run_cli(cli: Cli) -> i32 {
         return 2;
     }
     let out_root = convert::output_root(&cli.source, &cli.dest);
-    let jobs = convert::find_jobs(&cli.source, &out_root, cli.flatten);
-    if jobs.is_empty() {
-        println!("No PSD or PSB files found in {}", cli.source.display());
-        return 0;
+    let opts = convert::Options {
+        quality: cli.quality,
+        skip_existing: !cli.overwrite,
+        threads: cli.threads,
+        flatten: cli.flatten,
+        include_subfolders: !cli.no_subfolders,
+        convert_raw: cli.raw,
+        copy_jpegs: cli.copy_jpegs,
+    };
+    println!("Searching {}…", cli.source.display());
+    let found = convert::scan(&cli.source, Some(&out_root), &opts, &AtomicBool::new(false), |_| {});
+    for p in &found.problems {
+        eprintln!("{p}");
     }
-    println!("Found {} files. Saving to {}", jobs.len(), out_root.display());
+    let jobs = convert::find_jobs(&cli.source, &found.files, &out_root, cli.flatten);
+    if jobs.is_empty() {
+        println!("No matching files found in {}", cli.source.display());
+        return if found.problems.is_empty() { 0 } else { 1 };
+    }
+    println!(
+        "Found {} Photoshop, {} raw, {} JPEG to copy. Saving to {}",
+        found.count(convert::Kind::Photoshop),
+        found.count(convert::Kind::Raw),
+        found.count(convert::Kind::Jpeg),
+        out_root.display()
+    );
 
-    let opts = convert::Options { quality: cli.quality, skip_existing: !cli.overwrite, threads: cli.threads, flatten: cli.flatten };
     let done = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
-    let problems = Mutex::new(Vec::new());
+    let problems = Mutex::new(found.problems.clone());
     let total = jobs.len();
     let cancel = AtomicBool::new(false);
 
@@ -94,12 +123,13 @@ fn run_cli(cli: Cli) -> i32 {
         eprintln!("Error: {e}");
         return 1;
     }
+    let had_problems = !found.problems.is_empty();
     let failed = failed.load(Ordering::Relaxed);
     if let Some(p) = convert::write_report(&out_root, &problems.into_inner().unwrap()) {
         println!("Problems listed in {}", p.display());
     }
     println!("Finished: {} of {total} files OK.", total - failed);
-    if failed > 0 { 1 } else { 0 }
+    if failed > 0 || had_problems { 1 } else { 0 }
 }
 
 /// On Windows the app is a GUI program, so reconnect to the terminal for CLI use.

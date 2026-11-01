@@ -1,6 +1,6 @@
 //! The desktop window.
 
-use crate::convert::{self, Event, Options};
+use crate::convert::{self, Event, Kind, Options};
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Layout, Margin, RichText, Sense, Stroke, Vec2,
 };
@@ -29,7 +29,7 @@ const RED: Color32 = Color32::from_rgb(0xf0, 0x60, 0x60);
 pub fn run() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PSD to JPEG Converter")
-        .with_inner_size([720.0, 780.0])
+        .with_inner_size([720.0, 840.0])
         .with_min_inner_size([560.0, 560.0])
         .with_drag_and_drop(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(ICON_PNG) {
@@ -117,6 +117,7 @@ struct Progress {
     skipped: AtomicUsize,
     failed: AtomicUsize,
     warned: AtomicUsize,
+    unreadable: AtomicUsize,
     cancel: AtomicBool,
     finished: AtomicBool,
     status: Mutex<String>,
@@ -135,11 +136,21 @@ impl Progress {
     }
 }
 
-/// Background count of the PSD files in the chosen folder.
+/// Background search of the chosen folder, so the window can show what it found.
 struct Scan {
     path: PathBuf,
-    count: AtomicUsize,
+    /// The options that affect what's found (subfolders, raw, JPEGs).
+    key: (bool, bool, bool),
+    psd: AtomicUsize,
+    raw: AtomicUsize,
+    jpeg: AtomicUsize,
+    unreadable: AtomicUsize,
     done: AtomicBool,
+    stop: AtomicBool,
+}
+
+fn scan_key(o: &Options) -> (bool, bool, bool) {
+    (o.include_subfolders, o.convert_raw, o.copy_jpegs)
 }
 
 struct App {
@@ -177,6 +188,9 @@ impl App {
             app.set_source(s.into(), &cc.egui_ctx);
             app.dest = Some(d.into());
             app.options.flatten = std::env::var("DEMO_FLATTEN").is_ok();
+            app.options.convert_raw = std::env::var("DEMO_RAW").is_ok();
+            app.options.copy_jpegs = std::env::var("DEMO_JPEG").is_ok();
+            app.rescan(&cc.egui_ctx);
             app.show_log = std::env::var("DEMO_LOG").is_ok();
             if std::env::var("DEMO_RUN").is_ok() {
                 app.start(&cc.egui_ctx);
@@ -190,23 +204,40 @@ impl App {
     }
 
     fn set_source(&mut self, dir: PathBuf, ctx: &egui::Context) {
-        if let Some(old) = &self.scan {
-            old.done.store(true, Ordering::Relaxed); // stops the old count
-        }
-        let scan = Arc::new(Scan { path: dir.clone(), count: AtomicUsize::new(0), done: AtomicBool::new(false) });
-        self.scan = Some(scan.clone());
-        self.source = Some(dir.clone());
+        self.source = Some(dir);
         self.progress = None;
+        self.rescan(ctx);
+    }
+
+    /// Count what's in the chosen folder (again), e.g. after an option changes.
+    fn rescan(&mut self, ctx: &egui::Context) {
+        if let Some(old) = &self.scan {
+            old.stop.store(true, Ordering::Relaxed);
+        }
+        let Some(dir) = self.source.clone() else { return };
+        let scan = Arc::new(Scan {
+            path: dir.clone(),
+            key: scan_key(&self.options),
+            psd: AtomicUsize::new(0),
+            raw: AtomicUsize::new(0),
+            jpeg: AtomicUsize::new(0),
+            unreadable: AtomicUsize::new(0),
+            done: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        });
+        self.scan = Some(scan.clone());
+        let opts = self.options.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            for entry in walkdir::WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {
-                if scan.done.load(Ordering::Relaxed) {
-                    return;
-                }
-                if entry.file_type().is_file() && convert::is_psd(entry.path()) {
-                    scan.count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            let result = convert::scan(&dir, None, &opts, &scan.stop, |kind| {
+                let counter = match kind {
+                    Kind::Photoshop => &scan.psd,
+                    Kind::Raw => &scan.raw,
+                    Kind::Jpeg => &scan.jpeg,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            });
+            scan.unreadable.store(result.problems.len(), Ordering::Relaxed);
             scan.done.store(true, Ordering::Relaxed);
             ctx.request_repaint();
         });
@@ -224,22 +255,28 @@ impl App {
         std::thread::spawn(move || {
             *progress.status.lock().unwrap() = "Searching for Photoshop files…".into();
             ctx.request_repaint();
-            let jobs = convert::find_jobs(&source, &out_root, opts.flatten);
+            let found = convert::scan(&source, Some(&out_root), &opts, &progress.cancel, |_| {});
+            for p in &found.problems {
+                progress.log(format!("⚠  {p}"));
+            }
+            progress.unreadable.store(found.problems.len(), Ordering::Relaxed);
+            let jobs = convert::find_jobs(&source, &found.files, &out_root, opts.flatten);
             progress.total.store(jobs.len(), Ordering::Relaxed);
             *progress.status.lock().unwrap() = if jobs.is_empty() {
-                "No PSD or PSB files were found in that folder.".into()
+                "Nothing to convert was found in that folder.".into()
             } else {
                 format!("Converting {} files…", fmt_num(jobs.len()))
             };
             ctx.request_repaint();
 
-            let problems = Mutex::new(Vec::new());
+            let problems = Mutex::new(found.problems);
             let rel = |p: &Path| p.strip_prefix(&source).unwrap_or(p).display().to_string();
             let result = convert::run(&jobs, &opts, &progress.cancel, |ev| {
                 match ev {
                     Event::Converted { job, warnings } => {
                         progress.converted.fetch_add(1, Ordering::Relaxed);
-                        progress.log(format!("✔  {}", rel(&job.src)));
+                        let verb = if job.kind == Kind::Jpeg { "copied" } else { "converted" };
+                        progress.log(format!("✔  {}  ({verb})", rel(&job.src)));
                         if !warnings.is_empty() {
                             progress.warned.fetch_add(1, Ordering::Relaxed);
                         }
@@ -271,7 +308,12 @@ impl App {
             } else if progress.cancel.load(Ordering::Relaxed) {
                 *status = "Stopped. Convert again with \"Skip files already converted\" on to carry on.".into();
             } else if !jobs.is_empty() {
-                *status = "All done.".into();
+                let bad = progress.unreadable.load(Ordering::Relaxed);
+                *status = if bad > 0 {
+                    format!("Done, but {bad} folder(s) couldn't be opened. See the problem list.")
+                } else {
+                    "All done.".into()
+                };
             }
             drop(status);
             progress.finished.store(true, Ordering::Relaxed);
@@ -291,6 +333,9 @@ impl eframe::App for App {
             if let Some(dir) = dropped {
                 self.set_source(dir, &ctx);
             }
+        }
+        if !running && self.source.is_some() && self.scan.as_ref().is_some_and(|s| s.key != scan_key(&self.options)) {
+            self.rescan(&ctx);
         }
         if self.scan.as_ref().is_some_and(|s| !s.done.load(Ordering::Relaxed)) {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -335,7 +380,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(RichText::new("PSD to JPEG Converter").font(semibold(21.0)));
-                ui.label(RichText::new("Batch convert Photoshop files, including every subfolder").color(MUTED));
+                ui.label(RichText::new("Batch convert Photoshop and camera RAW files, including every subfolder").color(MUTED));
             });
         });
     }
@@ -361,21 +406,13 @@ impl App {
                             ui.add(egui::Label::new(RichText::new(folder_name(p)).font(semibold(15.0))).truncate());
                             ui.add(egui::Label::new(RichText::new(p.display().to_string()).small().color(MUTED)).truncate());
                             if let Some(scan) = self.scan.as_ref().filter(|s| &s.path == p) {
-                                let n = scan.count.load(Ordering::Relaxed);
-                                let done = scan.done.load(Ordering::Relaxed);
-                                let (text, colour) = match (done, n) {
-                                    (false, n) => (format!("Looking for Photoshop files… {}", fmt_num(n)), MUTED),
-                                    (true, 0) => ("No PSD or PSB files found here".to_string(), AMBER),
-                                    (true, 1) => ("1 Photoshop file found".to_string(), GREEN),
-                                    (true, n) => (format!("{} Photoshop files found", fmt_num(n)), GREEN),
-                                };
-                                ui.label(RichText::new(text).small().color(colour));
+                                scan_summary(ui, scan, &self.options);
                             }
                         }
                         None => {
                             let msg = if hovering { "Drop the folder here" } else { "Drag a folder here, or click Browse" };
                             ui.label(RichText::new(msg).font(semibold(15.0)));
-                            ui.label(RichText::new("All subfolders are included").small().color(MUTED));
+                            ui.label(RichText::new("Every subfolder, at every level, is searched").small().color(MUTED));
                         }
                     });
                 });
@@ -398,7 +435,7 @@ impl App {
                     }
                     None => {
                         ui.label(RichText::new("Choose where the converted files should go").font(semibold(15.0)));
-                        ui.label(RichText::new("Your original PSD files are never changed").small().color(MUTED));
+                        ui.label(RichText::new("Your original files are never changed").small().color(MUTED));
                     }
                 }
                 if let (Some(s), Some(d)) = (&self.source, &self.dest) {
@@ -423,6 +460,28 @@ impl App {
 
     fn options_card(&mut self, ui: &mut egui::Ui) {
         card(ui, "OPTIONS", |ui| {
+            ui.label(RichText::new("What to include").font(semibold(14.0)));
+            ui.add_space(-2.0);
+            option_check(
+                ui,
+                &mut self.options.include_subfolders,
+                "Search all subfolders",
+                "Goes through every folder inside, however deep. Untick to use only the files directly in the chosen folder.",
+            );
+            option_check(
+                ui,
+                &mut self.options.convert_raw,
+                "Also convert camera RAW files",
+                "Sony .ARW, plus Canon .CR2/.CR3, Nikon .NEF, Fujifilm .RAF, .DNG and other raw formats.",
+            );
+            option_check(
+                ui,
+                &mut self.options.copy_jpegs,
+                "Also copy JPEGs already in the folder",
+                "Existing .jpg files are copied across unchanged, so everything ends up together.",
+            );
+
+            ui.add_space(10.0);
             ui.label(RichText::new("Folder layout").font(semibold(14.0)));
             ui.columns(2, |cols| {
                 choice_tile(
@@ -430,7 +489,7 @@ impl App {
                     &mut self.options.flatten,
                     false,
                     "Keep folder structure",
-                    "Subfolders are recreated, so every JPEG sits where its PSD was.",
+                    "Subfolders are recreated, so every JPEG sits where its original was.",
                 );
                 choice_tile(
                     &mut cols[1],
@@ -670,6 +729,55 @@ fn choice_tile(ui: &mut egui::Ui, value: &mut bool, this: bool, title: &str, des
     if enabled && resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+}
+
+/// A tick box with a bold label and a grey explanation underneath.
+fn option_check(ui: &mut egui::Ui, value: &mut bool, label: &str, desc: &str) {
+    ui.add_space(2.0);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.checkbox(value, RichText::new(label).font(semibold(13.5)));
+        ui.horizontal(|ui| {
+            ui.add_space(26.0);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.add(egui::Label::new(RichText::new(desc).small().color(MUTED)).wrap());
+            });
+        });
+    });
+}
+
+/// "1,240 Photoshop · 320 RAW · 85 JPEG found" under the chosen folder.
+fn scan_summary(ui: &mut egui::Ui, scan: &Scan, opts: &Options) {
+    let done = scan.done.load(Ordering::Relaxed);
+    let (psd, raw, jpeg) = (
+        scan.psd.load(Ordering::Relaxed),
+        scan.raw.load(Ordering::Relaxed),
+        scan.jpeg.load(Ordering::Relaxed),
+    );
+    let mut parts = vec![format!("{} Photoshop", fmt_num(psd))];
+    if opts.convert_raw {
+        parts.push(format!("{} RAW", fmt_num(raw)));
+    }
+    if opts.copy_jpegs {
+        parts.push(format!("{} JPEG", fmt_num(jpeg)));
+    }
+    let total = psd + raw + jpeg;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if !done {
+            ui.label(RichText::new(format!("Searching… {} so far", parts.join("  ·  "))).small().color(MUTED));
+        } else if total == 0 {
+            ui.label(RichText::new("Nothing to convert found here").small().color(AMBER));
+        } else {
+            ui.label(RichText::new(format!("{} files found", parts.join("  ·  "))).small().color(GREEN));
+        }
+        let bad = scan.unreadable.load(Ordering::Relaxed);
+        if done && bad > 0 {
+            let s = if bad == 1 { "" } else { "s" };
+            ui.label(RichText::new(format!("·  {bad} folder{s} couldn't be opened")).small().color(AMBER))
+                .on_hover_text("They're listed in the problem list after converting.");
+        }
+    });
 }
 
 fn stat(ui: &mut egui::Ui, label: &str, n: usize, colour: Color32) {
