@@ -1,8 +1,8 @@
 [package]
 name = "psd-to-jpeg-converter"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
-description = "Batch convert Photoshop PSD/PSB files (including every subfolder) to JPEG, keeping the folder structure."
+description = "Batch convert Photoshop PSD/PSB files (including every subfolder) to JPEG, keeping the folder structure. Also re-saves camcorder video for DaVinci Resolve."
 license = "MIT"
 
 [dependencies]

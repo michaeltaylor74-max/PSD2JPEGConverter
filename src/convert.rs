@@ -24,6 +24,8 @@ pub struct Options {
     pub convert_raw: bool,
     /// Also copy JPEGs that are already in the folder.
     pub copy_jpegs: bool,
+    /// Also re-save camcorder video (.MTS etc.) as .mov for DaVinci Resolve.
+    pub convert_video: bool,
 }
 
 impl Default for Options {
@@ -36,6 +38,7 @@ impl Default for Options {
             include_subfolders: true,
             convert_raw: false,
             copy_jpegs: false,
+            convert_video: false,
         }
     }
 }
@@ -48,6 +51,18 @@ pub enum Kind {
     Photoshop,
     /// Camera raw (ARW etc.).
     Raw,
+    /// Camcorder video (.MTS etc.), re-saved as .mov for DaVinci Resolve.
+    Video,
+}
+
+impl Kind {
+    /// Extension of the file this kind turns into.
+    pub fn out_ext(self) -> &'static str {
+        match self {
+            Kind::Video => "mov",
+            _ => "jpg",
+        }
+    }
 }
 
 pub struct Job {
@@ -82,6 +97,7 @@ pub fn classify(path: &Path, opts: &Options) -> Option<Kind> {
     match ext.as_deref() {
         Some("psd") | Some("psb") => Some(Kind::Photoshop),
         Some(e) if RAW_EXTS.contains(&e) => opts.convert_raw.then_some(Kind::Raw),
+        Some(e) if crate::video::VIDEO_EXTS.contains(&e) => opts.convert_video.then_some(Kind::Video),
         Some("jpg") | Some("jpeg") | Some("jpe") => opts.copy_jpegs.then_some(Kind::Jpeg),
         // Older Mac files often have no extension, or a name like "Logo v1.2"
         // that only looks like one, so look inside those.
@@ -96,11 +112,13 @@ fn has_psd_signature(path: &Path) -> bool {
     fs::File::open(path).and_then(|mut f| f.read_exact(&mut sig)).is_ok() && &sig == b"8BPS"
 }
 
-/// Name for the output file without ".jpg": "photo.psd" -> "photo", but
+/// Name for the output file without ".jpg"/".mov": "photo.psd" -> "photo", but
 /// "Logo v1.2" (no real extension) keeps its full name.
 fn base_name(path: &Path) -> String {
     let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
-    let known = ["psd", "psb", "jpg", "jpeg", "jpe"].contains(&ext.as_str()) || RAW_EXTS.contains(&ext.as_str());
+    let known = ["psd", "psb", "jpg", "jpeg", "jpe"].contains(&ext.as_str())
+        || RAW_EXTS.contains(&ext.as_str())
+        || crate::video::VIDEO_EXTS.contains(&ext.as_str());
     let name = if known { path.file_stem() } else { path.file_name() };
     name.unwrap_or_default().to_string_lossy().into_owned()
 }
@@ -210,11 +228,11 @@ pub fn find_jobs(source: &Path, files: &[(PathBuf, Kind)], out_root: &Path, flat
         .into_iter()
         .map(|(kind, src, rel)| {
             let stem = base_name(&rel);
-            // Copied JPEGs keep their exact file name; converted files get ".jpg".
+            // Copied JPEGs keep their exact file name; converted files get ".jpg" (or ".mov").
             let file = if kind == Kind::Jpeg {
                 rel.file_name().unwrap_or_default().to_string_lossy().into_owned()
             } else {
-                format!("{stem}.jpg")
+                format!("{stem}.{}", kind.out_ext())
             };
             let out = if flatten {
                 let folders = folders_of(&rel);
@@ -263,6 +281,11 @@ fn convert_one(job: &Job, quality: u8) -> Result<Vec<String>> {
         fs::rename(&tmp, &job.out).context("could not finalise output file")?;
         return Ok(Vec::new());
     }
+    if job.kind == Kind::Video {
+        let warnings = crate::video::rewrap_for_resolve(&job.src, &tmp)?;
+        fs::rename(&tmp, &job.out).context("could not finalise output file")?;
+        return Ok(warnings);
+    }
 
     let img = match job.kind {
         Kind::Raw => crate::raw::decode(&job.src)?,
@@ -289,28 +312,36 @@ pub fn run<F>(jobs: &[Job], opts: &Options, cancel: &AtomicBool, on_event: F) ->
 where
     F: Fn(Event) + Sync,
 {
+    let process = |job: &Job| {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        if opts.skip_existing && job.out.exists() {
+            on_event(Event::Skipped { job });
+            return;
+        }
+        // A badly damaged file must never take the whole batch down with it.
+        let result = std::panic::catch_unwind(|| convert_one(job, opts.quality))
+            .unwrap_or_else(|p| Err(anyhow::anyhow!("unexpected problem reading this file ({})", panic_text(&p))));
+        match result {
+            Ok(w) => on_event(Event::Converted { job, warnings: &w }),
+            Err(e) => {
+                let _ = fs::remove_file(part_path(&job.out));
+                on_event(Event::Failed { job, error: format!("{e:#}") })
+            }
+        }
+    };
+    let (videos, images): (Vec<&Job>, Vec<&Job>) = jobs.iter().partition(|j| j.kind == Kind::Video);
+
     let pool = rayon::ThreadPoolBuilder::new().num_threads(opts.threads).build()?;
-    pool.install(|| {
-        jobs.par_iter().for_each(|job| {
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
-            if opts.skip_existing && job.out.exists() {
-                on_event(Event::Skipped { job });
-                return;
-            }
-            // A badly damaged file must never take the whole batch down with it.
-            let result = std::panic::catch_unwind(|| convert_one(job, opts.quality))
-                .unwrap_or_else(|p| Err(anyhow::anyhow!("unexpected problem reading this file ({})", panic_text(&p))));
-            match result {
-                Ok(w) => on_event(Event::Converted { job, warnings: &w }),
-                Err(e) => {
-                    let _ = fs::remove_file(part_path(&job.out));
-                    on_event(Event::Failed { job, error: format!("{e:#}") })
-                }
-            }
-        });
-    });
+    pool.install(|| images.par_iter().for_each(|job| process(job)));
+
+    // Video is mostly reading and writing large files, so only a couple at a
+    // time: more would just make the disk (or OneDrive) slower for all of them.
+    if !videos.is_empty() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        pool.install(|| videos.par_iter().for_each(|job| process(job)));
+    }
     Ok(())
 }
 

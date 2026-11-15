@@ -1,6 +1,6 @@
 # PSD to JPEG Converter
 
-Batch converts Photoshop files to JPEG. Point it at a folder and it converts every `.psd` and `.psb` file in that folder **and all of its subfolders, however deep**. It can also convert camera RAW files (Sony `.ARW` and others) and copy across any JPEGs already there. The JPEGs can either keep the same folder layout or all go into one folder. Your original files are never touched.
+Batch converts Photoshop files to JPEG. Point it at a folder and it converts every `.psd` and `.psb` file in that folder **and all of its subfolders, however deep**. It can also convert camera RAW files (Sony `.ARW` and others), copy across any JPEGs already there, and re-save camcorder video (`.MTS`) so DaVinci Resolve plays its sound. The JPEGs can either keep the same folder layout or all go into one folder. Your original files are never touched.
 
 ![Screenshot](assets/screenshot.png)
 
@@ -31,6 +31,7 @@ Go to the **Releases** page and download the file for your computer (ignore the 
 3. Choose **what to include**:
    - **Search all subfolders** (on by default) – every folder inside, at every level, including folders that are shortcuts to somewhere else. Untick it to use only the files directly in the chosen folder.
    - **Also convert camera RAW files** – Sony `.ARW`, plus Canon `.CR2`/`.CR3`, Nikon `.NEF`, Fujifilm `.RAF`, `.DNG` and other raw formats. They're developed at full resolution, with brightness, contrast and colour matched to the preview the camera stores in each file, so they look like the camera's own JPEGs.
+   - **Also convert camcorder video for DaVinci Resolve** – AVCHD `.MTS`/`.M2TS` and older `.MOD`/`.TOD` clips are saved as `.mov`. Camcorders record the sound as Dolby Digital (AC-3), which Resolve can't play, so the clips import silently; the sound is changed to uncompressed PCM, and the picture is copied exactly, with no loss of quality. This needs the free **ffmpeg** program: on Windows, tick the option and click *Install ffmpeg* (or run `winget install Gyan.FFmpeg`); on a Mac, `brew install ffmpeg`. Video files are done two at a time, after the images.
    - **Also copy JPEGs already in the folder** – existing JPEGs are copied across unchanged, keeping their names. If a camera saved `DSC001.ARW` and `DSC001.JPG` together, the camera's JPEG keeps its name and the converted one becomes `DSC001 (ARW).jpg`.
 4. Pick a **folder layout**:
    - **Keep folder structure** – the subfolders are recreated, so each JPEG sits where its original was (as in the example above).
@@ -60,10 +61,10 @@ Go to the **Releases** page and download the file for your computer (ignore the 
 Running the program with arguments skips the window:
 
 ```
-psd-to-jpeg-converter <SOURCE FOLDER> <DESTINATION FOLDER> [--quality 92] [--raw] [--copy-jpegs] [--flatten] [--no-subfolders] [--overwrite] [--threads N]
+psd-to-jpeg-converter <SOURCE FOLDER> <DESTINATION FOLDER> [--quality 92] [--raw] [--video] [--copy-jpegs] [--flatten] [--no-subfolders] [--overwrite] [--threads N]
 ```
 
-`--raw` also converts camera RAW files, `--copy-jpegs` copies existing JPEGs, `--flatten` puts everything into one folder, and `--no-subfolders` uses only the files directly in SOURCE.
+`--raw` also converts camera RAW files, `--video` re-saves camcorder video as `.mov` for DaVinci Resolve, `--copy-jpegs` copies existing JPEGs, `--flatten` puts everything into one folder, and `--no-subfolders` uses only the files directly in SOURCE.
 
 ## Building from source
 
@@ -73,4 +74,4 @@ Install Rust from <https://rustup.rs>, then:
 cargo build --release
 ```
 
-The program is at `target/release/psd-to-jpeg-converter` (`.exe` on Windows). Pushing a tag such as `v1.2.0` (or running the *Build* workflow from the Actions tab with a release tag filled in) makes GitHub build and publish the Windows, Mac and Linux downloads automatically.
+The program is at `target/release/psd-to-jpeg-converter` (`.exe` on Windows). Pushing a tag such as `v1.3.0` (or running the *Build* workflow from the Actions tab with a release tag filled in) makes GitHub build and publish the Windows, Mac and Linux downloads automatically.
