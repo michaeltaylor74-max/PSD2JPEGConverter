@@ -5,6 +5,7 @@ mod convert;
 mod decode;
 mod gui;
 mod raw;
+mod video;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Batch convert Photoshop PSD/PSB files (and optionally camera raw files) to JPEG, including every subfolder.
+/// It can also re-save camcorder video so DaVinci Resolve plays the sound.
 ///
 /// Run with no arguments to open the window. With arguments, it runs in the
 /// terminal: the converted copy goes to <DEST>/<name of SOURCE folder>/...
@@ -40,6 +42,9 @@ struct Cli {
     /// Also copy JPEGs that are already in SOURCE
     #[arg(long)]
     copy_jpegs: bool,
+    /// Also re-save camcorder video (.MTS, .M2TS, .MOD, .TOD) as .mov for DaVinci Resolve (needs ffmpeg)
+    #[arg(long)]
+    video: bool,
     /// Files to convert at once (0 = one per CPU core)
     #[arg(short, long, default_value_t = 0)]
     threads: usize,
@@ -73,6 +78,7 @@ fn run_cli(cli: Cli) -> i32 {
         include_subfolders: !cli.no_subfolders,
         convert_raw: cli.raw,
         copy_jpegs: cli.copy_jpegs,
+        convert_video: cli.video,
     };
     println!("Searching {}…", cli.source.display());
     let found = convert::scan(&cli.source, Some(&out_root), &opts, &AtomicBool::new(false), |_| {});
@@ -85,13 +91,17 @@ fn run_cli(cli: Cli) -> i32 {
         return if found.problems.is_empty() { 0 } else { 1 };
     }
     println!(
-        "Found {} Photoshop, {} raw, {} JPEG to copy. Saving to {}",
+        "Found {} Photoshop, {} raw, {} video, {} JPEG to copy. Saving to {}",
         found.count(convert::Kind::Photoshop),
         found.count(convert::Kind::Raw),
+        found.count(convert::Kind::Video),
         found.count(convert::Kind::Jpeg),
         out_root.display()
     );
 
+    if found.count(convert::Kind::Video) > 0 && video::find_ffmpeg().is_none() {
+        eprintln!("{}", video::missing_message());
+    }
     let done = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
     let problems = Mutex::new(found.problems.clone());

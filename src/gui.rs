@@ -139,18 +139,19 @@ impl Progress {
 /// Background search of the chosen folder, so the window can show what it found.
 struct Scan {
     path: PathBuf,
-    /// The options that affect what's found (subfolders, raw, JPEGs).
-    key: (bool, bool, bool),
+    /// The options that affect what's found (subfolders, raw, JPEGs, video).
+    key: (bool, bool, bool, bool),
     psd: AtomicUsize,
     raw: AtomicUsize,
     jpeg: AtomicUsize,
+    video: AtomicUsize,
     unreadable: AtomicUsize,
     done: AtomicBool,
     stop: AtomicBool,
 }
 
-fn scan_key(o: &Options) -> (bool, bool, bool) {
-    (o.include_subfolders, o.convert_raw, o.copy_jpegs)
+fn scan_key(o: &Options) -> (bool, bool, bool, bool) {
+    (o.include_subfolders, o.convert_raw, o.copy_jpegs, o.convert_video)
 }
 
 struct App {
@@ -162,6 +163,8 @@ struct App {
     scan: Option<Arc<Scan>>,
     logo: Option<egui::TextureHandle>,
     show_log: bool,
+    /// Where ffmpeg is (checked when video conversion is switched on).
+    ffmpeg: Option<Option<PathBuf>>,
 }
 
 impl App {
@@ -181,6 +184,7 @@ impl App {
             scan: None,
             logo,
             show_log: false,
+            ffmpeg: None,
         };
         // Development builds only: preset folders so screenshots can be taken.
         #[cfg(debug_assertions)]
@@ -190,6 +194,7 @@ impl App {
             app.options.flatten = std::env::var("DEMO_FLATTEN").is_ok();
             app.options.convert_raw = std::env::var("DEMO_RAW").is_ok();
             app.options.copy_jpegs = std::env::var("DEMO_JPEG").is_ok();
+            app.options.convert_video = std::env::var("DEMO_VIDEO").is_ok();
             app.rescan(&cc.egui_ctx);
             app.show_log = std::env::var("DEMO_LOG").is_ok();
             if std::env::var("DEMO_RUN").is_ok() {
@@ -221,6 +226,7 @@ impl App {
             psd: AtomicUsize::new(0),
             raw: AtomicUsize::new(0),
             jpeg: AtomicUsize::new(0),
+            video: AtomicUsize::new(0),
             unreadable: AtomicUsize::new(0),
             done: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -234,6 +240,7 @@ impl App {
                     Kind::Photoshop => &scan.psd,
                     Kind::Raw => &scan.raw,
                     Kind::Jpeg => &scan.jpeg,
+                    Kind::Video => &scan.video,
                 };
                 counter.fetch_add(1, Ordering::Relaxed);
             });
@@ -253,7 +260,7 @@ impl App {
         let ctx = ctx.clone();
 
         std::thread::spawn(move || {
-            *progress.status.lock().unwrap() = "Searching for Photoshop files…".into();
+            *progress.status.lock().unwrap() = "Searching for files…".into();
             ctx.request_repaint();
             let found = convert::scan(&source, Some(&out_root), &opts, &progress.cancel, |_| {});
             for p in &found.problems {
@@ -275,7 +282,11 @@ impl App {
                 match ev {
                     Event::Converted { job, warnings } => {
                         progress.converted.fetch_add(1, Ordering::Relaxed);
-                        let verb = if job.kind == Kind::Jpeg { "copied" } else { "converted" };
+                        let verb = match job.kind {
+                            Kind::Jpeg => "copied",
+                            Kind::Video => "saved as .mov for Resolve",
+                            _ => "converted",
+                        };
                         progress.log(format!("✔  {}  ({verb})", rel(&job.src)));
                         if !warnings.is_empty() {
                             progress.warned.fetch_add(1, Ordering::Relaxed);
@@ -380,7 +391,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(RichText::new("PSD to JPEG Converter").font(semibold(21.0)));
-                ui.label(RichText::new("Batch convert Photoshop and camera RAW files, including every subfolder").color(MUTED));
+                ui.label(RichText::new("Batch convert Photoshop, camera RAW and camcorder video, including every subfolder").color(MUTED));
             });
         });
     }
@@ -426,7 +437,7 @@ impl App {
 
     fn dest_card(&mut self, ui: &mut egui::Ui) {
         let mut browse = false;
-        card(ui, "SAVE JPEGS TO", |ui| {
+        card(ui, "SAVE CONVERTED FILES TO", |ui| {
             browse = row_with_button(ui, save_icon, |ui| {
                 match &self.dest {
                     Some(p) => {
@@ -452,7 +463,7 @@ impl App {
             });
         });
         if browse {
-            if let Some(p) = rfd::FileDialog::new().set_title("Where to save the JPEGs").pick_folder() {
+            if let Some(p) = rfd::FileDialog::new().set_title("Where to save the converted files").pick_folder() {
                 self.dest = Some(p);
             }
         }
@@ -480,6 +491,17 @@ impl App {
                 "Also copy JPEGs already in the folder",
                 "Existing .jpg files are copied across unchanged, so everything ends up together.",
             );
+            option_check(
+                ui,
+                &mut self.options.convert_video,
+                "Also convert camcorder video for DaVinci Resolve",
+                "AVCHD .MTS/.M2TS and .MOD/.TOD clips are saved as .mov with the sound changed to a type Resolve can play. The picture is copied exactly, so there's no loss of quality.",
+            );
+            if self.options.convert_video {
+                self.ffmpeg_status(ui);
+            } else {
+                self.ffmpeg = None;
+            }
 
             ui.add_space(10.0);
             ui.label(RichText::new("Folder layout").font(semibold(14.0)));
@@ -519,6 +541,43 @@ impl App {
         });
     }
 
+    /// Under the video option: whether ffmpeg was found, with a way to install it.
+    fn ffmpeg_status(&mut self, ui: &mut egui::Ui) {
+        if self.ffmpeg.is_none() {
+            self.ffmpeg = Some(crate::video::find_ffmpeg());
+        }
+        let found = self.ffmpeg.clone().flatten();
+        ui.horizontal(|ui| {
+            ui.add_space(26.0);
+            match found {
+                Some(_) => {
+                    ui.label(RichText::new("✔ ffmpeg found, ready to convert video").small().color(GREEN));
+                }
+                None => {
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("ffmpeg (free) is needed for video and isn't installed yet.").small().color(AMBER),
+                            )
+                            .wrap(),
+                        );
+                        ui.horizontal(|ui| {
+                            #[cfg(windows)]
+                            if ui.small_button("Install ffmpeg").clicked() {
+                                crate::video::install_ffmpeg();
+                            }
+                            #[cfg(target_os = "macos")]
+                            ui.label(RichText::new("In Terminal: brew install ffmpeg").small().color(MUTED));
+                            if ui.small_button("Check again").clicked() {
+                                self.ffmpeg = None;
+                            }
+                        });
+                    });
+                }
+            }
+        });
+    }
+
     fn action_area(&mut self, ui: &mut egui::Ui, running: bool) {
         let ctx = ui.ctx().clone();
         let ready = self.source.is_some() && self.dest.is_some();
@@ -532,7 +591,8 @@ impl App {
             };
             ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
             let text_colour = if ready { Color32::WHITE } else { Color32::from_rgb(0x7a, 0x84, 0x9c) };
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Convert to JPEG", semibold(16.0), text_colour);
+            let label = if self.options.convert_video { "Convert" } else { "Convert to JPEG" };
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, semibold(16.0), text_colour);
             if ready && resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -541,7 +601,7 @@ impl App {
             }
             if !ready {
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Choose a folder to convert and where to save the JPEGs").small().color(MUTED));
+                    ui.label(RichText::new("Choose a folder to convert and where to save the converted files").small().color(MUTED));
                 });
             }
         }
@@ -749,10 +809,11 @@ fn option_check(ui: &mut egui::Ui, value: &mut bool, label: &str, desc: &str) {
 /// "1,240 Photoshop · 320 RAW · 85 JPEG found" under the chosen folder.
 fn scan_summary(ui: &mut egui::Ui, scan: &Scan, opts: &Options) {
     let done = scan.done.load(Ordering::Relaxed);
-    let (psd, raw, jpeg) = (
+    let (psd, raw, jpeg, video) = (
         scan.psd.load(Ordering::Relaxed),
         scan.raw.load(Ordering::Relaxed),
         scan.jpeg.load(Ordering::Relaxed),
+        scan.video.load(Ordering::Relaxed),
     );
     let mut parts = vec![format!("{} Photoshop", fmt_num(psd))];
     if opts.convert_raw {
@@ -761,7 +822,10 @@ fn scan_summary(ui: &mut egui::Ui, scan: &Scan, opts: &Options) {
     if opts.copy_jpegs {
         parts.push(format!("{} JPEG", fmt_num(jpeg)));
     }
-    let total = psd + raw + jpeg;
+    if opts.convert_video {
+        parts.push(format!("{} video", fmt_num(video)));
+    }
+    let total = psd + raw + jpeg + video;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         if !done {
